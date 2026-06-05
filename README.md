@@ -31,7 +31,7 @@
 ## 📈 Training Results (학습 결과)
 - **Epochs**: 150 (Early Stopping 적용으로 검증 손실 수렴 시 조기 종료 설정)
 - **Batch Size**: 16
-- **mAP50 성능**: 약 **70%** 달성 (트랙 위 젯봇의 위치를 거의 완벽하게 추론함)
+- **mAP50 성능**: 약 **99%** 달성 (트랙 위 젯봇의 위치를 거의 완벽하게 추론함)
 
 ![Training Results](./results.png)  
 *(상기 그래프를 통해 Train/Val Loss가 안정적으로 우하향하며, mAP 성능이 무결하게 수렴함을 확인할 수 있습니다.)*
