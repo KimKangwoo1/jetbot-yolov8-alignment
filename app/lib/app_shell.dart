@@ -976,7 +976,7 @@ void showAboutDialogPanel(BuildContext context) {
             _LogDetailRowPub(label: '버전', value: '1.0.0+1'),
             _LogDetailRowPub(label: '빌드', value: 'Flutter Web (CanvasKit)'),
             _LogDetailRowPub(label: '백엔드', value: 'Jetson Nano (예정)'),
-            _LogDetailRowPub(label: '연결', value: 'ws://172.16.42.14:8765'),
+            _LogDetailRowPub(label: '연결', value: 'ws://192.168.0.116:8765'),
             _LogDetailRowPub(label: '라이선스', value: 'Internal Use Only'),
           ],
         ),

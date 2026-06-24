@@ -9,10 +9,16 @@ import '../widgets/cctv_player.dart';
 import '../widgets/intersection_selector.dart';
 import '../widgets/webcam_feed.dart';
 
-// 효준 노트북 스트리머 주소 (detect_stream.py 출력 IP).
-// IP가 바뀌면 여기만 고치세요. 같은 와이파이 필수.
-const String kHyojunMjpegUrl = 'http://192.168.0.116:8080/stream';
-const String kHyojunWsUrl = 'ws://192.168.0.116:8765';
+// 스트리머(detect_stream.py)가 돌아가는 PC의 IP. 같은 와이파이/서브넷 필수.
+// 노트북·데스크탑 둘 다 적어두고, kActiveHost만 바꾸면 서버를 전환합니다.
+const String kHostNotebook = '192.168.0.26';   // 새 노트북
+const String kHostDesktop = '192.168.0.116';  // 효준 스트리머 노트북
+
+// 지금 접속할 서버: kHostNotebook ↔ kHostDesktop 중 하나로 변경하세요.
+const String kActiveHost = kHostDesktop;
+
+const String kHyojunMjpegUrl = 'http://$kActiveHost:8080/stream';
+const String kHyojunWsUrl = 'ws://$kActiveHost:8765';
 
 // 방향 키 → (라벨, 색상). 화면 표기 순서: 북·동·남·서.
 const List<(String, String, Color)> _dirMeta = [
@@ -29,6 +35,19 @@ DirectionLive? _dirData(LiveData d, String key) => switch (key) {
       'west' => d.west,
       _ => null,
     };
+
+const DirectionLive _emptyDirection = DirectionLive(
+  vehicleCount: 0,
+  normalCount: 0,
+  ambulanceCount: 0,
+  waitingCount: 0,
+  avgStopTime: 0,
+  straightCount: 0,
+  leftTurnCount: 0,
+  leftTurnRatio: 0,
+  congestionPercent: 0,
+  congestionLevel: '원활',
+);
 
 class MonitorScreen extends StatelessWidget {
   const MonitorScreen({super.key});
@@ -333,7 +352,9 @@ class _DirectionGaugesPanel extends StatelessWidget {
                 listenable: LiveData.instance,
                 builder: (context, _) {
                   final d = LiveData.instance;
-                  if (!d.hasDirections) {
+                  final hasAnyDirection =
+                      _dirMeta.any((m) => _dirData(d, m.$1) != null);
+                  if (!hasAnyDirection) {
                     return const WaitingBox(compact: true);
                   }
                   return Column(
@@ -343,7 +364,7 @@ class _DirectionGaugesPanel extends StatelessWidget {
                         _CongestionRow(
                           label: m.$2,
                           color: m.$3,
-                          data: _dirData(d, m.$1)!,
+                          data: _dirData(d, m.$1) ?? _emptyDirection,
                         ),
                     ],
                   );
@@ -508,15 +529,77 @@ class _OverallCongestionPanel extends StatelessWidget {
         padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: const [
-            PanelHeader(
+          children: [
+            const PanelHeader(
               title: '전체 혼잡도',
               icon: Icons.speed_outlined,
               trailing: _LinkHint(),
             ),
-            SizedBox(height: 4),
-            Expanded(child: WaitingBox(compact: true)),
-            SizedBox(height: 6),
+            const SizedBox(height: 8),
+            Expanded(
+              child: ListenableBuilder(
+                listenable: LiveData.instance,
+                builder: (context, _) {
+                  final k = LiveData.instance.kpis;
+                  if (k == null) return const WaitingBox(compact: true);
+                  final value = k.overallCongestion.clamp(0, 1).toDouble();
+                  final color = AppColors.forCongestion(value);
+                  return Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Text(
+                            '${(value * 100).round()}%',
+                            style: TextStyle(
+                              color: color,
+                              fontSize: 30,
+                              fontWeight: FontWeight.w800,
+                              height: 1,
+                              fontFeatures: const [FontFeature.tabularFigures()],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 3),
+                            child: StatusDotPill(
+                              label: value >= 0.7
+                                  ? '혼잡'
+                                  : value >= 0.35
+                                      ? '보통'
+                                      : '원활',
+                              color: color,
+                              dense: true,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      MiniBar(value: value, color: color),
+                      const SizedBox(height: 10),
+                      Row(
+                        children: [
+                          _MiniStat(
+                            label: '총 차량',
+                            value: '${k.totalVehicles}',
+                            color: AppColors.textSecondary,
+                          ),
+                          const Spacer(),
+                          _MiniStat(
+                            label: '평균 정차',
+                            value: '${k.avgWaitSec.toStringAsFixed(1)}s',
+                            color: AppColors.textSecondary,
+                          ),
+                        ],
+                      ),
+                    ],
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 6),
           ],
         ),
       ),
@@ -620,7 +703,9 @@ class _DirectionStatsRow extends StatelessWidget {
                   listenable: LiveData.instance,
                   builder: (context, _) {
                     final d = LiveData.instance;
-                    if (!d.hasDirections) {
+                    final hasAnyDirection =
+                        _dirMeta.any((m) => _dirData(d, m.$1) != null);
+                    if (!hasAnyDirection) {
                       return const WaitingBox();
                     }
                     return Row(
@@ -632,7 +717,8 @@ class _DirectionStatsRow extends StatelessWidget {
                             child: _DirCountCard(
                               label: _dirMeta[i].$2,
                               color: _dirMeta[i].$3,
-                              data: _dirData(d, _dirMeta[i].$1)!,
+                              data:
+                                  _dirData(d, _dirMeta[i].$1) ?? _emptyDirection,
                             ),
                           ),
                         ],
@@ -805,4 +891,3 @@ class _MiniStat extends StatelessWidget {
     );
   }
 }
-

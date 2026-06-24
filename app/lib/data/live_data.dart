@@ -54,18 +54,28 @@ class DirectionLive {
     required this.congestionLevel,
   });
 
-  factory DirectionLive.fromMap(Map<String, dynamic> m) => DirectionLive(
-        vehicleCount: _i(m['vehicle_count']),
-        normalCount: _i(m['normal_count']),
-        ambulanceCount: _i(m['ambulance_count']),
-        waitingCount: _i(m['waiting_count']),
-        avgStopTime: _d(m['avg_stop_time']),
-        straightCount: _i(m['straight_count']),
-        leftTurnCount: _i(m['left_turn_count']),
-        leftTurnRatio: _d(m['left_turn_ratio']),
-        congestionPercent: _d(m['congestion_percent']),
-        congestionLevel: (m['congestion_level'] as String?) ?? '원활',
-      );
+  factory DirectionLive.fromMap(Map<String, dynamic> m) {
+    final vehicleCount = _i(m['vehicle_count']);
+    final ambulanceCount = _i(m['ambulance_count']);
+    final normalCount = m.containsKey('normal_count')
+        ? _i(m['normal_count'])
+        : vehicleCount - ambulanceCount;
+    final waitingCount = m.containsKey('waiting_count')
+        ? _i(m['waiting_count'])
+        : vehicleCount;
+    return DirectionLive(
+      vehicleCount: vehicleCount,
+      normalCount: normalCount < 0 ? 0 : normalCount,
+      ambulanceCount: ambulanceCount,
+      waitingCount: waitingCount,
+      avgStopTime: _d(m['avg_stop_time']),
+      straightCount: _i(m['straight_count']),
+      leftTurnCount: _i(m['left_turn_count']),
+      leftTurnRatio: _d(m['left_turn_ratio']),
+      congestionPercent: _d(m['congestion_percent']),
+      congestionLevel: (m['congestion_level'] as String?) ?? '원활',
+    );
+  }
 
   /// 혼잡도 0..1 (기존 위젯 호환용).
   double get congestion => (congestionPercent / 100).clamp(0, 1);

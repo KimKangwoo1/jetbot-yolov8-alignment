@@ -35,7 +35,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _alertEmail = false;
   String _retention = '30일';
   bool _backupEnabled = true;
-  String _wsUrl = 'ws://172.16.42.14:8765';
+  String _wsUrl = 'ws://192.168.0.116:8765';
   String _aiMode = '균형';
   bool _dirty = false;
 

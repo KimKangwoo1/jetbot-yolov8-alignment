@@ -6,6 +6,18 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'live_data.dart';
 import 'supabase_config.dart';
 
+double _num(Object? v) => v == null
+    ? 0
+    : v is num
+        ? v.toDouble()
+        : double.tryParse('$v') ?? 0;
+
+int _int(Object? v) => v == null
+    ? 0
+    : v is num
+        ? v.toInt()
+        : int.tryParse('$v') ?? 0;
+
 // ============================================================
 // Supabase realtime → LiveData 브리지.
 //
@@ -42,12 +54,14 @@ class SupabaseService {
     _subs.add(
       _sb
           .from(SupabaseConfig.tTrafficStatus)
-          .stream(primaryKey: ['id']).listen(_onTraffic, onError: _onError),
+          .stream(primaryKey: ['id'])
+          .listen(_onTraffic, onError: (e, st) => _onError('traffic_status', e, st)),
     );
     _subs.add(
       _sb
           .from(SupabaseConfig.tSignalStatus)
-          .stream(primaryKey: ['id']).listen(_onSignal, onError: _onError),
+          .stream(primaryKey: ['id'])
+          .listen(_onSignal, onError: (e, st) => _onOptionalError('signal_status', e, st)),
     );
     _subs.add(
       _sb
@@ -55,13 +69,17 @@ class SupabaseService {
           .stream(primaryKey: ['id'])
           .order('detected_at')
           .limit(20)
-          .listen(_onEmergency, onError: _onError),
+          .listen(_onEmergency, onError: (e, st) => _onOptionalError('emergency_status', e, st)),
     );
   }
 
-  void _onError(Object e, [StackTrace? st]) {
-    debugPrint('[SupabaseService] stream error: $e');
+  void _onError(String table, Object e, [StackTrace? st]) {
+    debugPrint('[SupabaseService] $table stream error: $e');
     LiveData.instance.setDisconnected();
+  }
+
+  void _onOptionalError(String table, Object e, [StackTrace? st]) {
+    debugPrint('[SupabaseService] optional $table stream error: $e');
   }
 
   void _onTraffic(List<Map<String, dynamic>> rows) {
@@ -95,8 +113,41 @@ class SupabaseService {
       );
     }
 
-    LiveData.instance
-        .applySnapshot(north: n, south: s, east: e, west: w, kpis: kpis);
+    final signals = <String, SignalLive>{};
+    final emergencies = <EmergencyLive>[];
+    for (final row in rows) {
+      final direction = (row['direction'] as String?) ?? '';
+      if (direction.isEmpty) continue;
+      final emergency = (row['emergency'] as bool?) ?? false;
+      final congestion = _num(row['congestion_percent']);
+      signals[direction] = SignalLive(
+        direction: direction,
+        signalState: (row['signal_state'] as String?) ?? 'RED',
+        remainTime: 0,
+        controlMode:
+            emergency ? 'EMERGENCY' : (congestion >= 70 ? 'CONGESTION' : 'NORMAL'),
+      );
+      if (emergency) {
+        emergencies.add(EmergencyLive(
+          detected: true,
+          direction: direction,
+          ambulanceCount: _int(row['ambulance_count']),
+          confidence: 0,
+          priorityActive: true,
+          detectedAt: DateTime.tryParse('${row['updated_at']}')?.toLocal(),
+        ));
+      }
+    }
+
+    LiveData.instance.applySnapshot(
+      north: n,
+      south: s,
+      east: e,
+      west: w,
+      kpis: kpis,
+      signals: signals.isEmpty ? null : signals,
+      emergencies: emergencies,
+    );
   }
 
   void _onSignal(List<Map<String, dynamic>> rows) {

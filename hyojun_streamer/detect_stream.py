@@ -353,7 +353,12 @@ def to_traffic_status_row(row):
     return {
         "direction": row["direction"],
         "vehicle_count": row["vehicle_count"],
+        "normal_count": max(row["vehicle_count"] - row["ambulance_count"], 0),
         "ambulance_count": row["ambulance_count"],
+        "waiting_count": row["vehicle_count"],
+        "straight_count": row["vehicle_count"],
+        "left_turn_count": 0,
+        "left_turn_ratio": 0,
         "jetbot_count": row["jetbot_count"],
         "avg_stop_time": row["avg_stop_time"],
         "traffic_volume": row["traffic_volume"],
@@ -369,6 +374,7 @@ def to_congestion_history_row(row):
     return {
         "direction": row["direction"],
         "vehicle_count": row["vehicle_count"],
+        "normal_count": max(row["vehicle_count"] - row["ambulance_count"], 0),
         "ambulance_count": row["ambulance_count"],
         "congestion_percent": row["congestion"],
         "congestion_level": row["congestion_level"],

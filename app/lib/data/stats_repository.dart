@@ -124,7 +124,7 @@ class StatsRepository {
     final rows = await _sb
         .from(SupabaseConfig.tCongestionHistory)
         .select(
-          'direction,vehicle_count,normal_count,ambulance_count,'
+          'direction,vehicle_count,ambulance_count,'
           'congestion_percent,congestion_level,created_at',
         )
         .gte('created_at', from.toUtc().toIso8601String())

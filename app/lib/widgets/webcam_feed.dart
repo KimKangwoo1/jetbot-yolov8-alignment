@@ -5,8 +5,8 @@
 //
 // 사용 예:
 //   const WebcamFeed(
-//     mjpegUrl: 'http://192.168.0.15:8080/stream',
-//     wsUrl:    'ws://192.168.0.15:8765',
+//     mjpegUrl: 'http://10.15.6.240:8080/stream',
+//     wsUrl:    'ws://10.15.6.240:8765',
 //   )
 //
 // 주의:
