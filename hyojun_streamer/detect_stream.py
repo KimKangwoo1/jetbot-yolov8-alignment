@@ -5,7 +5,6 @@ Webcam YOLO streamer plus ESP32 traffic-light control.
 One process owns the webcam and does everything:
   - MJPEG video stream for the Flutter dashboard
   - WebSocket detection events
-  - vehicle detection with yolov8n.pt
   - custom JetBot/ambulance detection with JetBot_Last.onnx
   - ByteTrack tracking IDs for dashboard metrics
   - ROI congestion scoring
@@ -26,43 +25,67 @@ from queue import Empty, Queue
 import cv2
 import requests
 import websockets
-from flask import Flask, Response
+from flask import Flask, Response, jsonify, request
 from ultralytics import YOLO
-
-try:
-    from supabase import create_client
-except ImportError:
-    create_client = None  # pip install supabase 안 했으면 자동 비활성화
 
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+def load_local_env(path):
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env(BASE_DIR / ".env")
+
 CAMERA_INDEX = 0
-FRAME_WIDTH = 1280
-FRAME_HEIGHT = 720
-JPEG_QUALITY = 70
+FRAME_WIDTH = 960
+FRAME_HEIGHT = 540
+JPEG_QUALITY = 55
 MJPEG_PORT = 8080
 WS_PORT = 8765
 
 ESP32_IP = "192.168.0.162"
 ESP32_TIMEOUT = 0.7
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "traffic_status").strip()
+SUPABASE_INTERVAL = 1.0
+SUPABASE_TIMEOUT = 2.0
+TRAFFIC_STATUS_COLUMNS = (
+    "direction",
+    "vehicle_count",
+    "ambulance_count",
+    "jetbot_count",
+    "avg_stop_time",
+    "traffic_volume",
+    "congestion_level",
+    "signal_state",
+    "emergency",
+    "updated_at",
+)
 
-# Supabase (smartai-traffic). URL은 비밀이 아니라 기본값으로 박아두고,
-# KEY는 절대 코드에 넣지 말고 환경변수로만 받는다. RLS 때문에 service_role 키 필요.
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://yboglsatamplbdersejk.supabase.co")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")  # Dashboard > Settings > API > service_role
-SUPABASE_TABLE = "traffic_status"          # 방향별 실시간 현황 (direction unique -> upsert)
-SUPABASE_HISTORY_TABLE = "congestion_history"  # 혼잡도 누적 로그 (append)
-SUPABASE_WRITE_INTERVAL = 1.0              # traffic_status upsert 최소 간격(초)
-SUPABASE_HISTORY_INTERVAL = 10.0           # congestion_history append 간격(초)
-
-VEHICLE_MODEL_PATH = BASE_DIR / "yolov8n.pt"
-JETBOT_MODEL_PATH = BASE_DIR / "JetBot_Last.onnx"
+OPENVINO_MODEL_PATH = BASE_DIR / "JetBot_Last_openvino_model"
+ONNX_MODEL_PATH = BASE_DIR / "JetBot_Last.onnx"
+JETBOT_MODEL_PATH = OPENVINO_MODEL_PATH if OPENVINO_MODEL_PATH.exists() else ONNX_MODEL_PATH
 CLASSES_PATH = BASE_DIR / "classes.txt"
 ROI_CONFIG_PATH = BASE_DIR / "roi_config.json"
 TRACKER_CONFIG = "bytetrack.yaml"
+MODEL_IMGSZ = 640
+DETECT_EVERY = 3
 
-VEHICLE_CLASSES = {"car", "truck", "bus", "motorcycle"}
 DEFAULT_JETBOT_CLASSES = {"output_ambulance_normal", "output_jetbot"}
 AMBULANCE_CLASSES = {"output_ambulance_normal"}
 JETBOT_CLASSES = {"output_jetbot"}
@@ -72,37 +95,68 @@ DEFAULT_ROIS = [
     ("right_middle", 628, 212, 869, 306),
     ("bottom_center", 504, 312, 637, 530),
 ]
+DEFAULT_ROI_FRAME_WIDTH = 1280
+DEFAULT_ROI_FRAME_HEIGHT = 720
 
 CONF_THRES = 0.45
 EVENT_MIN_INTERVAL = 1.0
 JETBOT_THRESHOLD = 1
-STABLE_DETECTION_TIME = 1.0
-MIN_SIGNAL_INTERVAL = 1.0
-YELLOW_TIME = 0.5
+STABLE_DETECTION_TIME = 3.0
+MIN_SIGNAL_INTERVAL = 3.0
+YELLOW_TIME = 3.0
 CONGESTION_MAX_VEHICLES = 6
 CONGESTION_MAX_STOP_TIME = 10.0
 CONGESTION_FREE_FLOW_SPEED = 80.0
 CONGESTION_STOP_SPEED = 12.0
+CONGESTION_FULL_OCCUPANCY = 0.5
+CONGESTION_SIGNAL_THRESHOLD = 60.0
+AMBULANCE_CONF_THRES = 0.50
+AMBULANCE_STABLE_FRAMES = 3
+AMBULANCE_HOLD_TIME = 5.0
+AMBULANCE_LOST_TIMEOUT = 2.0
+AMBULANCE_MAX_GREEN_TIME = 10.0
+AMBULANCE_APPROACH_EPS_PX = 12.0
 TRACK_STALE_SECONDS = 2.0
 TRAFFIC_VOLUME_WINDOW = 60.0
 
 
 _latest_jpeg = None
 _latest_lock = threading.Lock()
+_overlay_enabled = True
+_overlay_lock = threading.Lock()
 _event_queue: "Queue[dict]" = Queue()
 _last_emit = {}
+_last_supabase_save = 0.0
+_last_supabase_config_log = 0.0
 _track_state = {}
 _traffic_passages = {}
-
-_supabase_client = None
-_supabase_queue: "Queue[list]" = Queue()
-_last_supabase_enqueue = 0.0
+_ambulance_motion = {}
+_emergency_state = {
+    "active": False,
+    "candidate_frames": 0,
+    "direction": None,
+    "roi": None,
+    "last_seen": 0.0,
+    "started_at": 0.0,
+    "max_conf": 0.0,
+}
 
 current_signal = "RED"
 last_signal_time = 0.0
 pending_signal = "RED"
 pending_signal_since = time.time()
 last_log_time = 0.0
+
+
+def set_overlay_enabled(enabled):
+    global _overlay_enabled
+    with _overlay_lock:
+        _overlay_enabled = bool(enabled)
+
+
+def is_overlay_enabled():
+    with _overlay_lock:
+        return _overlay_enabled
 
 
 def load_class_file(path):
@@ -118,22 +172,52 @@ def load_class_file(path):
     return names or set(DEFAULT_JETBOT_CLASSES)
 
 
-def load_rois(path):
+def scale_rois(rois, source_width, source_height, target_width, target_height):
+    scale_x = target_width / max(source_width, 1)
+    scale_y = target_height / max(source_height, 1)
+    return [
+        (
+            name,
+            int(x1 * scale_x),
+            int(y1 * scale_y),
+            int(x2 * scale_x),
+            int(y2 * scale_y),
+        )
+        for name, x1, y1, x2, y2 in rois
+    ]
+
+
+def load_rois(path, target_width, target_height):
     if not path.exists():
         print("[ROI] roi_config.json not found. Using built-in ROIs.")
-        return list(DEFAULT_ROIS)
+        return scale_rois(
+            DEFAULT_ROIS,
+            DEFAULT_ROI_FRAME_WIDTH,
+            DEFAULT_ROI_FRAME_HEIGHT,
+            target_width,
+            target_height,
+        )
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        source_width = int(data.get("frame_width", DEFAULT_ROI_FRAME_WIDTH))
+        source_height = int(data.get("frame_height", DEFAULT_ROI_FRAME_HEIGHT))
         rois = [
             (item["name"], int(item["x1"]), int(item["y1"]), int(item["x2"]), int(item["y2"]))
             for item in data["rois"]
         ]
+        rois = scale_rois(rois, source_width, source_height, target_width, target_height)
     except Exception as exc:
         print(f"[ROI] failed to read {path}: {exc}. Using built-in ROIs.")
-        return list(DEFAULT_ROIS)
+        return scale_rois(
+            DEFAULT_ROIS,
+            DEFAULT_ROI_FRAME_WIDTH,
+            DEFAULT_ROI_FRAME_HEIGHT,
+            target_width,
+            target_height,
+        )
 
-    print(f"[ROI] using {len(rois)} ROI(s): {path}")
+    print(f"[ROI] using {len(rois)} ROI(s): {path} -> {target_width}x{target_height}")
     return rois
 
 
@@ -146,6 +230,11 @@ def default_camera_from_roi_config(path, fallback):
         return int(data.get("camera_index", fallback))
     except Exception:
         return fallback
+
+
+def is_openvino_model(path):
+    path = Path(path)
+    return path.is_dir() and path.name.endswith("_openvino_model")
 
 
 def load_model(path, label, task=None):
@@ -171,10 +260,10 @@ def model_class_name(model, cls_id):
     return str(cls_id)
 
 
-def open_camera(camera_index):
+def open_camera(camera_index, width, height):
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     return cap
 
 
@@ -189,13 +278,13 @@ def send_signal(state, esp32_ip):
         return False
 
 
-def change_signal_with_yellow(target_signal, esp32_ip):
+def change_signal_with_yellow(target_signal, esp32_ip, force=False):
     global current_signal, last_signal_time
 
     now = time.time()
     if current_signal == target_signal:
         return
-    if now - last_signal_time < MIN_SIGNAL_INTERVAL:
+    if not force and now - last_signal_time < MIN_SIGNAL_INTERVAL:
         return
 
     print(f"[SIGNAL CHANGE] {current_signal} -> YELLOW -> {target_signal}")
@@ -239,7 +328,7 @@ def utc_timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def direction_for_roi(roi):
+def direction_for_roi(roi, frame_width, frame_height):
     roi_name, x1, y1, x2, y2 = roi
     lowered = roi_name.lower()
 
@@ -255,13 +344,153 @@ def direction_for_roi(roi):
     center_x = (x1 + x2) / 2
     center_y = (y1 + y2) / 2
 
-    if center_y < FRAME_HEIGHT * 0.35:
+    if center_y < frame_height * 0.35:
         return "north"
-    if center_y > FRAME_HEIGHT * 0.55:
+    if center_y > frame_height * 0.55:
         return "south"
-    if center_x < FRAME_WIDTH * 0.5:
+    if center_x < frame_width * 0.5:
         return "west"
     return "east"
+
+
+def distance_to_frame_center(center, frame_width, frame_height):
+    center_x, center_y = center
+    dx = center_x - frame_width / 2
+    dy = center_y - frame_height / 2
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def ambulance_motion_key(detection):
+    track_id = detection.get("track_id")
+    if track_id is not None:
+        return detection["source"], track_id
+    return detection["source"], detection.get("roi") or "untracked"
+
+
+def find_best_ambulance_candidate(detections, rois, args):
+    now = time.time()
+    roi_by_name = {roi[0]: roi for roi in rois}
+    best = None
+
+    for detection in detections:
+        if detection["name"] not in AMBULANCE_CLASSES:
+            continue
+        if detection["confidence"] < args.ambulance_conf_thres:
+            continue
+        if detection["roi"] is None:
+            continue
+
+        roi = roi_by_name.get(detection["roi"])
+        if roi is None:
+            continue
+
+        key = ambulance_motion_key(detection)
+        distance = distance_to_frame_center(
+            detection["center"],
+            args.width,
+            args.height,
+        )
+        previous = _ambulance_motion.get(key)
+        approaching = (
+            previous is None
+            or distance <= previous["distance"] + args.ambulance_approach_eps_px
+        )
+        _ambulance_motion[key] = {
+            "center": detection["center"],
+            "distance": distance,
+            "seen_at": now,
+        }
+
+        if not approaching:
+            continue
+
+        candidate = {
+            "detection": detection,
+            "roi": detection["roi"],
+            "direction": direction_for_roi(roi, args.width, args.height),
+            "confidence": detection["confidence"],
+            "distance": distance,
+        }
+        if best is None or candidate["confidence"] > best["confidence"]:
+            best = candidate
+
+    stale_keys = [
+        key
+        for key, state in _ambulance_motion.items()
+        if now - state["seen_at"] > args.ambulance_lost_timeout
+    ]
+    for key in stale_keys:
+        del _ambulance_motion[key]
+
+    return best
+
+
+def update_emergency_state(detections, rois, args):
+    now = time.time()
+    candidate = find_best_ambulance_candidate(detections, rois, args)
+
+    if candidate is not None:
+        same_roi = _emergency_state["roi"] in {None, candidate["roi"]}
+        if same_roi:
+            _emergency_state["candidate_frames"] += 1
+        else:
+            _emergency_state["candidate_frames"] = 1
+
+        _emergency_state["direction"] = candidate["direction"]
+        _emergency_state["roi"] = candidate["roi"]
+        _emergency_state["last_seen"] = now
+        _emergency_state["max_conf"] = max(
+            _emergency_state["max_conf"],
+            candidate["confidence"],
+        )
+
+        if (
+            not _emergency_state["active"]
+            and _emergency_state["candidate_frames"] >= args.ambulance_stable_frames
+        ):
+            _emergency_state["active"] = True
+            _emergency_state["started_at"] = now
+    elif not _emergency_state["active"]:
+        _emergency_state["candidate_frames"] = 0
+        _emergency_state["direction"] = None
+        _emergency_state["roi"] = None
+        _emergency_state["max_conf"] = 0.0
+
+    if _emergency_state["active"]:
+        active_time = now - _emergency_state["started_at"]
+        lost_time = now - _emergency_state["last_seen"]
+        may_release = active_time >= args.ambulance_hold_time
+        lost_release = lost_time >= args.ambulance_lost_timeout
+        max_release = active_time >= args.ambulance_max_green_time
+
+        if may_release and (lost_release or max_release):
+            _emergency_state["active"] = False
+            _emergency_state["candidate_frames"] = 0
+            _emergency_state["direction"] = None
+            _emergency_state["roi"] = None
+            _emergency_state["last_seen"] = 0.0
+            _emergency_state["started_at"] = 0.0
+            _emergency_state["max_conf"] = 0.0
+
+    active_time = (
+        now - _emergency_state["started_at"]
+        if _emergency_state["active"]
+        else 0.0
+    )
+    lost_time = (
+        now - _emergency_state["last_seen"]
+        if _emergency_state["last_seen"]
+        else None
+    )
+    return {
+        "active": _emergency_state["active"],
+        "candidateFrames": _emergency_state["candidate_frames"],
+        "direction": _emergency_state["direction"],
+        "roi": _emergency_state["roi"],
+        "activeTimeSec": round(active_time, 2),
+        "lostTimeSec": round(lost_time, 2) if lost_time is not None else None,
+        "maxConfidence": round(_emergency_state["max_conf"], 3),
+    }
 
 
 def emit_detection(name, conf, source, roi_name=None, track_id=None):
@@ -285,7 +514,7 @@ def emit_detection(name, conf, source, roi_name=None, track_id=None):
     print(f"[DETECT] {evt}")
 
 
-def emit_signal_state(raw_signal, roi_count, total_count, status):
+def emit_signal_state(raw_signal, roi_count, total_count, status, emergency_state=None):
     now = time.time()
     if now - _last_emit.get("signal-status", 0) < EVENT_MIN_INTERVAL:
         return
@@ -299,6 +528,7 @@ def emit_signal_state(raw_signal, roi_count, total_count, status):
             "roiCount": roi_count,
             "totalCount": total_count,
             "status": status,
+            "emergency": emergency_state or {"active": False},
             "ts": now,
         }
     )
@@ -321,7 +551,7 @@ def emit_congestion_state(summary, roi_metrics, supabase_rows):
             "level": summary["level"],
             "roi": summary["roi"],
             "direction": summary["direction"],
-            "formula": "queue_score*0.4 + delay_score*0.4 + speed_score*0.2",
+            "formula": "vc_score*0.40 + delay_score*0.40 + speed_score*0.20",
             "rois": roi_metrics,
             "supabaseRow": summary_row,
             "supabaseRows": supabase_rows,
@@ -330,112 +560,97 @@ def emit_congestion_state(summary, roi_metrics, supabase_rows):
     )
 
 
-def init_supabase():
-    """환경변수로 Supabase 클라이언트를 만든다. 패키지/키 없으면 비활성화."""
-    global _supabase_client
-    if create_client is None:
-        print("[SUPABASE] supabase 패키지 없음 -> 저장 비활성화 (pip install supabase)")
-        return None
-    if not SUPABASE_KEY:
-        print("[SUPABASE] SUPABASE_KEY 환경변수 비어있음 -> 저장 비활성화")
-        return None
+def post_supabase_rows(rows, url, key, table, timeout):
+    endpoint = f"{url}/rest/v1/{table}"
+    prefer = "return=minimal"
+    if table.strip().lower() == "traffic_status":
+        endpoint = f"{endpoint}?on_conflict=direction"
+        prefer = "resolution=merge-duplicates,return=minimal"
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": prefer,
+    }
+
     try:
-        _supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print(f"[SUPABASE] connected: {SUPABASE_URL} -> {SUPABASE_TABLE}")
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=rows,
+            timeout=timeout,
+        )
+        if 200 <= response.status_code < 300:
+            print(f"[SUPABASE] saved {len(rows)} row(s)")
+        else:
+            print(
+                f"[SUPABASE] save failed: {response.status_code} "
+                f"{response.text[:300]}"
+            )
     except Exception as exc:
-        print(f"[SUPABASE] init failed: {exc}")
-        _supabase_client = None
-    return _supabase_client
+        print(f"[SUPABASE] save failed: {exc}")
 
 
-def to_traffic_status_row(row):
-    """calculate_congestion이 만든 row -> traffic_status 컬럼으로 매핑."""
-    return {
-        "direction": row["direction"],
-        "vehicle_count": row["vehicle_count"],
-        "normal_count": max(row["vehicle_count"] - row["ambulance_count"], 0),
-        "ambulance_count": row["ambulance_count"],
-        "waiting_count": row["vehicle_count"],
-        "straight_count": row["vehicle_count"],
-        "left_turn_count": 0,
-        "left_turn_ratio": 0,
-        "jetbot_count": row["jetbot_count"],
-        "avg_stop_time": row["avg_stop_time"],
-        "traffic_volume": row["traffic_volume"],
-        "congestion_percent": row["congestion"],   # 이름 다름: congestion -> congestion_percent
-        "congestion_level": row["congestion_level"],
-        "signal_state": row["signal_state"],
-        "emergency": row["emergency"],
-        "updated_at": row["updated_at"],
-    }
+def normalize_supabase_rows(rows, table):
+    table_name = table.strip().lower()
+
+    if table_name == "traffic_status":
+        return [
+            {key: row[key] for key in TRAFFIC_STATUS_COLUMNS if key in row}
+            for row in rows
+        ]
+
+    if table_name == "congestion_history":
+        history_rows = []
+        for row in rows:
+            history_rows.append(
+                {
+                    "direction": row.get("direction"),
+                    "vehicle_count": row.get("vehicle_count", 0),
+                    "normal_count": row.get("jetbot_count", 0),
+                    "ambulance_count": row.get("ambulance_count", 0),
+                    "congestion_percent": row.get("congestion", 0.0),
+                    "congestion_level": row.get("congestion_level"),
+                    "created_at": row.get("updated_at"),
+                }
+            )
+        return history_rows
+
+    return [dict(row) for row in rows]
 
 
-def to_congestion_history_row(row):
-    return {
-        "direction": row["direction"],
-        "vehicle_count": row["vehicle_count"],
-        "normal_count": max(row["vehicle_count"] - row["ambulance_count"], 0),
-        "ambulance_count": row["ambulance_count"],
-        "congestion_percent": row["congestion"],
-        "congestion_level": row["congestion_level"],
-    }
+def save_supabase_rows(supabase_rows, args):
+    global _last_supabase_save, _last_supabase_config_log
 
-
-def dedupe_by_direction(rows):
-    """같은 방향 ROI가 여러 개여도 upsert가 깨지지 않도록 방향당 1건(혼잡도 최대)만."""
-    best = {}
-    for row in rows:
-        direction = row["direction"]
-        if direction not in best or row["congestion"] > best[direction]["congestion"]:
-            best[direction] = row
-    return list(best.values())
-
-
-def enqueue_supabase(supabase_rows):
-    """캡처 루프를 막지 않도록 throttle 후 워커 큐에 넘긴다."""
-    global _last_supabase_enqueue
-    if _supabase_client is None or not supabase_rows:
+    if args.no_supabase or not supabase_rows:
         return
-    now = time.time()
-    if now - _last_supabase_enqueue < SUPABASE_WRITE_INTERVAL:
-        return
-    _last_supabase_enqueue = now
-    _supabase_queue.put(supabase_rows)
 
+    url = (args.supabase_url or "").strip().rstrip("/")
+    key = (args.supabase_key or "").strip()
+    table = (args.supabase_table or "").strip()
 
-def run_supabase_worker():
-    """별도 스레드: 큐에서 최신 row를 받아 traffic_status upsert + history append."""
-    last_history = 0.0
-    while True:
-        rows = _supabase_queue.get()
-        # 밀려있으면 가장 최근 것만 사용 (오래된 프레임 버림)
-        try:
-            while True:
-                rows = _supabase_queue.get_nowait()
-        except Empty:
-            pass
-
-        if _supabase_client is None or not rows:
-            continue
-
-        rows = dedupe_by_direction(rows)
+    if not url or not key or not table:
         now = time.time()
-        try:
-            _supabase_client.table(SUPABASE_TABLE).upsert(
-                [to_traffic_status_row(r) for r in rows],
-                on_conflict="direction",
-            ).execute()
-        except Exception as exc:
-            print(f"[SUPABASE] {SUPABASE_TABLE} upsert failed: {exc}")
+        if now - _last_supabase_config_log >= 5.0:
+            print(
+                "[SUPABASE] disabled: set SUPABASE_URL, SUPABASE_KEY, "
+                "and SUPABASE_TABLE or pass --supabase-url/--supabase-key/--supabase-table"
+            )
+            _last_supabase_config_log = now
+        return
 
-        if now - last_history >= SUPABASE_HISTORY_INTERVAL:
-            last_history = now
-            try:
-                _supabase_client.table(SUPABASE_HISTORY_TABLE).insert(
-                    [to_congestion_history_row(r) for r in rows]
-                ).execute()
-            except Exception as exc:
-                print(f"[SUPABASE] {SUPABASE_HISTORY_TABLE} insert failed: {exc}")
+    now = time.time()
+    if now - _last_supabase_save < args.supabase_interval:
+        return
+
+    _last_supabase_save = now
+    rows = normalize_supabase_rows(supabase_rows, table)
+    threading.Thread(
+        target=post_supabase_rows,
+        args=(rows, url, key, table, args.supabase_timeout),
+        daemon=True,
+    ).start()
 
 
 def box_track_id(box):
@@ -452,21 +667,38 @@ def box_track_id(box):
             return None
 
 
-def collect_detections(frame, model, target_classes, source, conf_thres, tracker_config, use_tracking):
+def collect_detections(
+    frame,
+    model,
+    target_classes,
+    source,
+    conf_thres,
+    tracker_config,
+    use_tracking,
+    imgsz,
+    device,
+):
     detections = []
     if model is None:
         return detections
 
+    infer_kwargs = {
+        "conf": conf_thres,
+        "imgsz": imgsz,
+        "verbose": False,
+    }
+    if device:
+        infer_kwargs["device"] = device
+
     if use_tracking:
         results = model.track(
             frame,
-            conf=conf_thres,
-            verbose=False,
             persist=True,
             tracker=tracker_config,
+            **infer_kwargs,
         )[0]
     else:
-        results = model.predict(frame, conf=conf_thres, verbose=False)[0]
+        results = model.predict(frame, **infer_kwargs)[0]
 
     for box in results.boxes:
         cls_id = int(box.cls[0])
@@ -491,10 +723,6 @@ def collect_detections(frame, model, target_classes, source, conf_thres, tracker
             }
         )
     return detections
-
-
-def source_matches(source, selected_source):
-    return selected_source == "all" or source == selected_source
 
 
 def count_roi_detections(detections):
@@ -609,7 +837,7 @@ def update_track_metrics(detections, args):
 def congestion_level(score):
     if score >= 70:
         return "HIGH"
-    if score >= 35:
+    if score >= 40:
         return "MEDIUM"
     return "LOW"
 
@@ -628,12 +856,11 @@ def calculate_congestion(rois, detections, args):
     updated_at = utc_timestamp()
 
     for roi in rois:
-        roi_name = roi[0]
+        roi_name, x1, y1, x2, y2 = roi
         roi_detections = [
             detection
             for detection in detections
             if detection["roi"] == roi_name
-            and source_matches(detection["source"], args.congestion_source)
         ]
 
         count = count_roi_detections(roi_detections)
@@ -650,7 +877,7 @@ def calculate_congestion(rois, detections, args):
         avg_stop_time = sum(stop_values) / len(stop_values) if stop_values else 0.0
         avg_speed = sum(speed_values) / len(speed_values) if speed_values else None
 
-        queue_score = min(count / max(args.congestion_max_vehicles, 1), 1.0) * 100.0
+        vc_score = min(count / max(args.congestion_max_vehicles, 1), 1.0) * 100.0
         delay_score = min(avg_stop_time / max(args.congestion_max_stop_time, 0.1), 1.0) * 100.0
         if avg_speed is None or count == 0:
             speed_score = 0.0
@@ -659,13 +886,34 @@ def calculate_congestion(rois, detections, args):
                 1.0 - min(avg_speed / max(args.congestion_free_flow_speed, 0.1), 1.0)
             ) * 100.0
 
+        roi_area = max((x2 - x1) * (y2 - y1), 1)
+        bbox_area_sum = 0
+        for detection in roi_detections:
+            bx1, by1, bx2, by2 = detection["box"]
+            ix1 = max(bx1, x1)
+            iy1 = max(by1, y1)
+            ix2 = min(bx2, x2)
+            iy2 = min(by2, y2)
+            bbox_area_sum += max(ix2 - ix1, 0) * max(iy2 - iy1, 0)
+
+        occupancy = bbox_area_sum / roi_area
+        occupancy_score = (
+            min(occupancy / max(args.congestion_full_occupancy, 0.01), 1.0)
+            * 100.0
+        )
+
         score = round(
-            min(queue_score * 0.4 + delay_score * 0.4 + speed_score * 0.2, 100.0),
+            min(
+                vc_score * 0.40
+                + delay_score * 0.40
+                + speed_score * 0.20,
+                100.0,
+            ),
             1,
         )
         level = congestion_level(score)
         level_ko = congestion_level_ko(level)
-        direction = direction_for_roi(roi)
+        direction = direction_for_roi(roi, args.width, args.height)
         row = {
             "direction": direction,
             "vehicle_count": count,
@@ -688,9 +936,12 @@ def calculate_congestion(rois, detections, args):
                 "score": score,
                 "level": level,
                 "levelKo": level_ko,
-                "queueScore": round(queue_score, 1),
+                "vcScore": round(vc_score, 1),
+                "queueScore": round(vc_score, 1),
                 "delayScore": round(delay_score, 1),
                 "speedScore": round(speed_score, 1),
+                "occupancyScore": round(occupancy_score, 1),
+                "occupancy": round(occupancy, 3),
                 "avgStopTimeSec": round(avg_stop_time, 2),
                 "avgSpeedPxSec": round(avg_speed, 2) if avg_speed is not None else None,
                 "trafficVolume": traffic_volume,
@@ -783,6 +1034,7 @@ def draw_status(
     rois,
     tracking_enabled,
     congestion_summary,
+    emergency_state,
 ):
     lines = [
         f"ROI Count: {roi_count} / Threshold: {JETBOT_THRESHOLD}",
@@ -790,6 +1042,11 @@ def draw_status(
         f"Camera: {camera_index} / ROIs: {len(rois)} active / Stream+Signal",
         f"Tracking: {'ByteTrack' if tracking_enabled else 'OFF'}",
         f"Congestion: {congestion_summary['level']} {congestion_summary['score']} / ROI: {congestion_summary['roi']}",
+        (
+            f"Emergency: {emergency_state.get('active')} / "
+            f"ROI: {emergency_state.get('roi')} / "
+            f"Frames: {emergency_state.get('candidateFrames', 0)}"
+        ),
     ]
 
     for index, text in enumerate(lines):
@@ -830,36 +1087,86 @@ def update_signal_from_roi(roi_count, total_count, args):
     return raw_target_signal, status
 
 
+def update_signal_from_controller(
+    emergency_state,
+    congestion_summary,
+    roi_count,
+    total_count,
+    args,
+):
+    global last_log_time
+
+    score = float(congestion_summary.get("score") or 0.0)
+    level = congestion_summary.get("level")
+    roi_name = congestion_summary.get("roi")
+
+    if emergency_state.get("active"):
+        raw_target_signal = "GREEN"
+        status = "EMERGENCY"
+    elif score >= args.congestion_signal_threshold:
+        raw_target_signal = "GREEN"
+        status = "CONGESTION"
+    else:
+        raw_target_signal = "RED"
+        status = "NORMAL"
+
+    if emergency_state.get("active"):
+        if not args.no_signal:
+            change_signal_with_yellow(raw_target_signal, args.esp32_ip, force=True)
+    else:
+        stable_target_signal = get_stable_signal(raw_target_signal)
+        if stable_target_signal is not None and not args.no_signal:
+            change_signal_with_yellow(stable_target_signal, args.esp32_ip)
+
+    now = time.time()
+    if now - last_log_time >= 0.5:
+        print(
+            f"Status: {status}, Emergency: {emergency_state.get('active')}, "
+            f"Emergency ROI: {emergency_state.get('roi')}, "
+            f"Congestion: {score:.1f}, Level: {level}, ROI: {roi_name}, "
+            f"ROI Count: {roi_count}, Total: {total_count}, "
+            f"Raw Target: {raw_target_signal}, Current: {current_signal}"
+        )
+        last_log_time = now
+
+    emit_signal_state(raw_target_signal, roi_count, total_count, status, emergency_state)
+    return raw_target_signal, status
+
+
 def capture_and_detect(args):
     global _latest_jpeg
 
-    vehicle_model = None
-    jetbot_model = None
+    jetbot_model = load_model(Path(args.jetbot_model), "jetbot", task="detect")
 
-    if not args.no_vehicles:
-        vehicle_model = load_model(Path(args.vehicle_model), "vehicle")
+    if jetbot_model is None:
+        raise RuntimeError("JetBot_Last.onnx could not be loaded. Check model path.")
 
-    if not args.no_jetbot:
-        jetbot_model = load_model(Path(args.jetbot_model), "jetbot", task="detect")
-
-    if vehicle_model is None and jetbot_model is None:
-        raise RuntimeError("No YOLO model loaded. Check model paths.")
-
-    rois = load_rois(Path(args.roi_config))
+    rois = load_rois(Path(args.roi_config), args.width, args.height)
     jetbot_classes = load_class_file(Path(args.classes))
-    print(f"[YOLO] vehicle target classes: {sorted(VEHICLE_CLASSES)}")
+    print(f"[YOLO] using model: {Path(args.jetbot_model)}")
     print(f"[YOLO] jetbot target classes: {sorted(jetbot_classes)}")
 
     if not args.no_signal:
         send_signal("RED", args.esp32_ip)
         time.sleep(0.5)
 
-    cap = open_camera(args.camera)
+    cap = open_camera(args.camera, args.width, args.height)
     if not cap.isOpened():
         raise RuntimeError(f"Camera {args.camera} could not be opened. Try --camera 1 or 2.")
 
-    print(f"[CAM] capture loop started: camera={args.camera}")
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    print(
+        f"[CAM] capture loop started: camera={args.camera}, "
+        f"{args.width}x{args.height}, imgsz={args.imgsz}, detect_every={args.detect_every}"
+    )
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_quality]
+    frame_index = 0
+    last_detections = []
+    last_roi_count = 0
+    last_raw_signal = "RED"
+    last_status = "START"
+    last_congestion_summary = {"score": 0.0, "level": "LOW", "direction": None, "roi": None}
+    last_congestion_metrics = []
+    last_emergency_state = {"active": False}
 
     while True:
         ok, frame = cap.read()
@@ -867,75 +1174,108 @@ def capture_and_detect(args):
             time.sleep(0.05)
             continue
 
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+        frame = cv2.resize(frame, (args.width, args.height))
 
-        vehicle_detections = collect_detections(
-            frame,
-            vehicle_model,
-            VEHICLE_CLASSES,
-            "vehicle",
-            args.conf,
-            args.tracker,
-            not args.no_tracking,
-        )
-        jetbot_detections = collect_detections(
-            frame,
-            jetbot_model,
-            jetbot_classes,
-            "jetbot",
-            args.conf,
-            args.tracker,
-            not args.no_tracking,
-        )
+        should_detect = frame_index % max(args.detect_every, 1) == 0
+        frame_index += 1
 
-        total_detections = vehicle_detections + jetbot_detections
-        for detection in total_detections:
-            center_x, center_y = detection["center"]
-            detection["roi"] = get_roi_for_point(center_x, center_y, rois)
-            emit_detection(
-                detection["name"],
-                detection["confidence"],
-                detection["source"],
-                detection["roi"],
-                detection["track_id"],
+        if should_detect:
+            jetbot_detections = collect_detections(
+                frame,
+                jetbot_model,
+                jetbot_classes,
+                "jetbot",
+                args.conf,
+                args.tracker,
+                not args.no_tracking,
+                args.imgsz,
+                args.device,
             )
 
-        signal_detections = (
-            total_detections if args.signal_source == "all"
-            else vehicle_detections if args.signal_source == "vehicle"
-            else jetbot_detections
-        )
-        roi_count = count_roi_detections(signal_detections)
-        raw_signal, status = update_signal_from_roi(roi_count, len(total_detections), args)
+            total_detections = jetbot_detections
+            for detection in total_detections:
+                center_x, center_y = detection["center"]
+                detection["roi"] = get_roi_for_point(center_x, center_y, rois)
+                emit_detection(
+                    detection["name"],
+                    detection["confidence"],
+                    detection["source"],
+                    detection["roi"],
+                    detection["track_id"],
+                )
 
-        update_track_metrics(total_detections, args)
-        if args.no_congestion:
-            congestion_summary = {"score": 0.0, "level": "OFF", "direction": None, "roi": None}
-            congestion_metrics = []
-            supabase_rows = []
+            roi_count = count_roi_detections(jetbot_detections)
+            update_track_metrics(total_detections, args)
+            emergency_state = update_emergency_state(total_detections, rois, args)
+            if args.no_congestion:
+                congestion_summary = {
+                    "score": 0.0,
+                    "level": "OFF",
+                    "direction": None,
+                    "roi": None,
+                }
+                congestion_metrics = []
+                supabase_rows = []
+                raw_signal, status = update_signal_from_controller(
+                    emergency_state,
+                    congestion_summary,
+                    roi_count,
+                    len(total_detections),
+                    args,
+                )
+            else:
+                congestion_summary, congestion_metrics, supabase_rows = calculate_congestion(
+                    rois,
+                    total_detections,
+                    args,
+                )
+                raw_signal, status = update_signal_from_controller(
+                    emergency_state,
+                    congestion_summary,
+                    roi_count,
+                    len(total_detections),
+                    args,
+                )
+                for row in supabase_rows:
+                    row["signal_state"] = current_signal
+                for metric in congestion_metrics:
+                    metric["signalState"] = current_signal
+                    metric["supabase"]["signal_state"] = current_signal
+                save_supabase_rows(supabase_rows, args)
+                emit_congestion_state(congestion_summary, congestion_metrics, supabase_rows)
+
+            last_detections = total_detections
+            last_roi_count = roi_count
+            last_raw_signal = raw_signal
+            last_status = status
+            last_congestion_summary = congestion_summary
+            last_congestion_metrics = congestion_metrics
+            last_emergency_state = emergency_state
         else:
-            congestion_summary, congestion_metrics, supabase_rows = calculate_congestion(
-                rois,
-                total_detections,
-                args,
-            )
-            emit_congestion_state(congestion_summary, congestion_metrics, supabase_rows)
-            enqueue_supabase(supabase_rows)
+            total_detections = last_detections
+            roi_count = last_roi_count
+            raw_signal = last_raw_signal
+            status = last_status
+            congestion_summary = last_congestion_summary
+            congestion_metrics = last_congestion_metrics
+            emergency_state = last_emergency_state
 
-        for detection in total_detections:
-            draw_detection(frame, detection)
-        draw_rois(frame, rois, {item["roi"]: item for item in congestion_metrics})
-        draw_status(
-            frame,
-            roi_count,
-            len(total_detections),
-            raw_signal,
-            status,
-            args.camera,
-            rois,
-            not args.no_tracking,
-            congestion_summary,
-        )
+        if is_overlay_enabled():
+            for detection in total_detections:
+                draw_detection(frame, detection)
+            draw_rois(frame, rois, {item["roi"]: item for item in congestion_metrics})
+            draw_status(
+                frame,
+                roi_count,
+                len(total_detections),
+                raw_signal,
+                status,
+                args.camera,
+                rois,
+                not args.no_tracking,
+                congestion_summary,
+                emergency_state,
+            )
 
         ok2, buf = cv2.imencode(".jpg", frame, encode_param)
         if ok2:
@@ -970,9 +1310,42 @@ def stream():
     return Response(mjpeg_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+def overlay_payload():
+    return {
+        "overlay": is_overlay_enabled(),
+        "on": "/overlay?enabled=1",
+        "off": "/overlay?enabled=0",
+        "toggle": "/toggle-overlay",
+        "stream": "/stream",
+    }
+
+
+@app.route("/overlay")
+def overlay():
+    value = request.args.get("enabled")
+    if value is not None:
+        set_overlay_enabled(value.strip().lower() in {"1", "true", "on", "yes"})
+    return jsonify(overlay_payload())
+
+
+@app.route("/toggle-overlay")
+def toggle_overlay():
+    set_overlay_enabled(not is_overlay_enabled())
+    return jsonify(overlay_payload())
+
+
 @app.route("/")
 def index():
-    return '<h3>SmartAI streamer</h3><img src="/stream" style="max-width:100%">'
+    return """
+    <h3>SmartAI streamer</h3>
+    <p>
+      Overlay:
+      <a href="/overlay?enabled=1">ON</a>
+      <a href="/overlay?enabled=0">OFF</a>
+      <a href="/toggle-overlay">TOGGLE</a>
+    </p>
+    <img src="/stream" style="max-width:100%">
+    """
 
 
 _ws_clients = set()
@@ -1018,7 +1391,16 @@ def parse_args():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--camera", type=int, default=default_camera)
-    parser.add_argument("--vehicle-model", default=str(VEHICLE_MODEL_PATH))
+    parser.add_argument("--width", type=int, default=FRAME_WIDTH)
+    parser.add_argument("--height", type=int, default=FRAME_HEIGHT)
+    parser.add_argument("--jpeg-quality", type=int, default=JPEG_QUALITY)
+    parser.add_argument("--imgsz", type=int, default=MODEL_IMGSZ)
+    parser.add_argument("--detect-every", type=int, default=DETECT_EVERY)
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Inference device. For OpenVINO try: intel:cpu, intel:gpu, intel:npu",
+    )
     parser.add_argument("--jetbot-model", default=str(JETBOT_MODEL_PATH))
     parser.add_argument("--classes", default=str(CLASSES_PATH))
     parser.add_argument("--roi-config", default=str(ROI_CONFIG_PATH))
@@ -1026,20 +1408,40 @@ def parse_args():
     parser.add_argument("--esp32-ip", default=ESP32_IP)
     parser.add_argument("--conf", type=float, default=CONF_THRES)
     parser.add_argument("--roi-threshold", type=int, default=JETBOT_THRESHOLD)
-    parser.add_argument("--signal-source", choices=("jetbot", "vehicle", "all"), default="jetbot")
-    parser.add_argument("--congestion-source", choices=("jetbot", "vehicle", "all"), default="all")
     parser.add_argument("--congestion-max-vehicles", type=int, default=CONGESTION_MAX_VEHICLES)
     parser.add_argument("--congestion-max-stop-time", type=float, default=CONGESTION_MAX_STOP_TIME)
     parser.add_argument("--congestion-free-flow-speed", type=float, default=CONGESTION_FREE_FLOW_SPEED)
     parser.add_argument("--congestion-stop-speed", type=float, default=CONGESTION_STOP_SPEED)
+    parser.add_argument("--congestion-full-occupancy", type=float, default=CONGESTION_FULL_OCCUPANCY)
+    parser.add_argument("--congestion-signal-threshold", type=float, default=CONGESTION_SIGNAL_THRESHOLD)
     parser.add_argument("--traffic-volume-window", type=float, default=TRAFFIC_VOLUME_WINDOW)
-    parser.add_argument("--no-vehicles", action="store_true")
-    parser.add_argument("--no-jetbot", action="store_true")
+    parser.add_argument("--ambulance-conf-thres", type=float, default=AMBULANCE_CONF_THRES)
+    parser.add_argument("--ambulance-stable-frames", type=int, default=AMBULANCE_STABLE_FRAMES)
+    parser.add_argument("--ambulance-hold-time", type=float, default=AMBULANCE_HOLD_TIME)
+    parser.add_argument("--ambulance-lost-timeout", type=float, default=AMBULANCE_LOST_TIMEOUT)
+    parser.add_argument("--ambulance-max-green-time", type=float, default=AMBULANCE_MAX_GREEN_TIME)
+    parser.add_argument("--ambulance-approach-eps-px", type=float, default=AMBULANCE_APPROACH_EPS_PX)
+    parser.add_argument("--supabase-url", default=SUPABASE_URL)
+    parser.add_argument("--supabase-key", default=SUPABASE_KEY)
+    parser.add_argument("--supabase-table", default=SUPABASE_TABLE)
+    parser.add_argument("--supabase-interval", type=float, default=SUPABASE_INTERVAL)
+    parser.add_argument("--supabase-timeout", type=float, default=SUPABASE_TIMEOUT)
+    parser.add_argument("--no-supabase", action="store_true")
     parser.add_argument("--no-signal", action="store_true")
     parser.add_argument("--no-tracking", action="store_true")
     parser.add_argument("--no-congestion", action="store_true")
-    parser.add_argument("--no-supabase", action="store_true")
-    return parser.parse_args()
+    parser.add_argument("--no-overlay", action="store_true")
+    args = parser.parse_args()
+    model_path = Path(args.jetbot_model)
+    if (
+        str(args.jetbot_model).lower().endswith(".onnx") or is_openvino_model(model_path)
+    ) and args.imgsz != 640:
+        print(
+            f"[YOLO] model requires 640x640 input. "
+            f"Forcing --imgsz 640 (was {args.imgsz})."
+        )
+        args.imgsz = 640
+    return args
 
 
 def get_local_ip():
@@ -1051,11 +1453,7 @@ def get_local_ip():
 
 if __name__ == "__main__":
     args = parse_args()
-
-    if not args.no_supabase:
-        init_supabase()
-        if _supabase_client is not None:
-            threading.Thread(target=run_supabase_worker, daemon=True).start()
+    set_overlay_enabled(not args.no_overlay)
 
     threading.Thread(target=capture_and_detect, args=(args,), daemon=True).start()
     threading.Thread(target=run_ws_server, daemon=True).start()
@@ -1065,11 +1463,29 @@ if __name__ == "__main__":
     print(f"  video :  http://{ip}:{MJPEG_PORT}/stream")
     print(f"  event :  ws://{ip}:{WS_PORT}")
     print(f"  camera:  {args.camera}")
+    print(f"  frame :  {args.width}x{args.height}, jpeg={args.jpeg_quality}")
+    print(f"  yolo  :  imgsz={args.imgsz}, detect_every={args.detect_every}")
+    print(f"  device:  {args.device or 'auto'}")
     print(f"  signal:  {'off' if args.no_signal else args.esp32_ip}")
-    print(f"  signal source: {args.signal_source}, threshold: {args.roi_threshold}")
+    print(f"  signal threshold: {args.roi_threshold}")
+    print(f"  congestion signal threshold: {args.congestion_signal_threshold}")
+    print(
+        "  ambulance: "
+        f"conf>={args.ambulance_conf_thres}, "
+        f"stable={args.ambulance_stable_frames} frames, "
+        f"hold={args.ambulance_hold_time}s, "
+        f"lost={args.ambulance_lost_timeout}s, "
+        f"max={args.ambulance_max_green_time}s"
+    )
     print(f"  tracking: {'off' if args.no_tracking else args.tracker}")
-    print(f"  congestion: {'off' if args.no_congestion else args.congestion_source}")
-    print(f"  supabase: {'on -> ' + SUPABASE_TABLE if _supabase_client else 'off'}")
+    print(f"  congestion: {'off' if args.no_congestion else 'jetbot'}")
+    print(
+        "  supabase: "
+        f"{'off' if args.no_supabase else ('on' if args.supabase_url and args.supabase_key else 'missing config')} "
+        f"table={args.supabase_table or '-'}"
+    )
+    print(f"  overlay: {'off' if args.no_overlay else 'on'}")
+    print(f"  overlay control: http://{ip}:{MJPEG_PORT}/overlay?enabled=0 or 1")
     print("=" * 60)
 
     app.run(host="0.0.0.0", port=MJPEG_PORT, threaded=True)
