@@ -14,6 +14,7 @@ One process owns the webcam and does everything:
 import argparse
 import asyncio
 import json
+import os
 import socket
 import threading
 import time
@@ -30,6 +31,25 @@ from ultralytics import YOLO
 
 BASE_DIR = Path(__file__).resolve().parent
 
+
+def load_local_env(path):
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+load_local_env(BASE_DIR / ".env")
+
 CAMERA_INDEX = 0
 FRAME_WIDTH = 960
 FRAME_HEIGHT = 540
@@ -39,6 +59,23 @@ WS_PORT = 8765
 
 ESP32_IP = "192.168.0.162"
 ESP32_TIMEOUT = 0.7
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "traffic_status").strip()
+SUPABASE_INTERVAL = 1.0
+SUPABASE_TIMEOUT = 2.0
+TRAFFIC_STATUS_COLUMNS = (
+    "direction",
+    "vehicle_count",
+    "ambulance_count",
+    "jetbot_count",
+    "avg_stop_time",
+    "traffic_volume",
+    "congestion_level",
+    "signal_state",
+    "emergency",
+    "updated_at",
+)
 
 OPENVINO_MODEL_PATH = BASE_DIR / "JetBot_Last_openvino_model"
 ONNX_MODEL_PATH = BASE_DIR / "JetBot_Last.onnx"
@@ -89,6 +126,8 @@ _overlay_enabled = True
 _overlay_lock = threading.Lock()
 _event_queue: "Queue[dict]" = Queue()
 _last_emit = {}
+_last_supabase_save = 0.0
+_last_supabase_config_log = 0.0
 _track_state = {}
 _traffic_passages = {}
 _ambulance_motion = {}
@@ -519,6 +558,99 @@ def emit_congestion_state(summary, roi_metrics, supabase_rows):
             "ts": now,
         }
     )
+
+
+def post_supabase_rows(rows, url, key, table, timeout):
+    endpoint = f"{url}/rest/v1/{table}"
+    prefer = "return=minimal"
+    if table.strip().lower() == "traffic_status":
+        endpoint = f"{endpoint}?on_conflict=direction"
+        prefer = "resolution=merge-duplicates,return=minimal"
+
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": prefer,
+    }
+
+    try:
+        response = requests.post(
+            endpoint,
+            headers=headers,
+            json=rows,
+            timeout=timeout,
+        )
+        if 200 <= response.status_code < 300:
+            print(f"[SUPABASE] saved {len(rows)} row(s)")
+        else:
+            print(
+                f"[SUPABASE] save failed: {response.status_code} "
+                f"{response.text[:300]}"
+            )
+    except Exception as exc:
+        print(f"[SUPABASE] save failed: {exc}")
+
+
+def normalize_supabase_rows(rows, table):
+    table_name = table.strip().lower()
+
+    if table_name == "traffic_status":
+        return [
+            {key: row[key] for key in TRAFFIC_STATUS_COLUMNS if key in row}
+            for row in rows
+        ]
+
+    if table_name == "congestion_history":
+        history_rows = []
+        for row in rows:
+            history_rows.append(
+                {
+                    "direction": row.get("direction"),
+                    "vehicle_count": row.get("vehicle_count", 0),
+                    "normal_count": row.get("jetbot_count", 0),
+                    "ambulance_count": row.get("ambulance_count", 0),
+                    "congestion_percent": row.get("congestion", 0.0),
+                    "congestion_level": row.get("congestion_level"),
+                    "created_at": row.get("updated_at"),
+                }
+            )
+        return history_rows
+
+    return [dict(row) for row in rows]
+
+
+def save_supabase_rows(supabase_rows, args):
+    global _last_supabase_save, _last_supabase_config_log
+
+    if args.no_supabase or not supabase_rows:
+        return
+
+    url = (args.supabase_url or "").strip().rstrip("/")
+    key = (args.supabase_key or "").strip()
+    table = (args.supabase_table or "").strip()
+
+    if not url or not key or not table:
+        now = time.time()
+        if now - _last_supabase_config_log >= 5.0:
+            print(
+                "[SUPABASE] disabled: set SUPABASE_URL, SUPABASE_KEY, "
+                "and SUPABASE_TABLE or pass --supabase-url/--supabase-key/--supabase-table"
+            )
+            _last_supabase_config_log = now
+        return
+
+    now = time.time()
+    if now - _last_supabase_save < args.supabase_interval:
+        return
+
+    _last_supabase_save = now
+    rows = normalize_supabase_rows(supabase_rows, table)
+    threading.Thread(
+        target=post_supabase_rows,
+        args=(rows, url, key, table, args.supabase_timeout),
+        daemon=True,
+    ).start()
 
 
 def box_track_id(box):
@@ -1109,6 +1241,7 @@ def capture_and_detect(args):
                 for metric in congestion_metrics:
                     metric["signalState"] = current_signal
                     metric["supabase"]["signal_state"] = current_signal
+                save_supabase_rows(supabase_rows, args)
                 emit_congestion_state(congestion_summary, congestion_metrics, supabase_rows)
 
             last_detections = total_detections
@@ -1288,6 +1421,12 @@ def parse_args():
     parser.add_argument("--ambulance-lost-timeout", type=float, default=AMBULANCE_LOST_TIMEOUT)
     parser.add_argument("--ambulance-max-green-time", type=float, default=AMBULANCE_MAX_GREEN_TIME)
     parser.add_argument("--ambulance-approach-eps-px", type=float, default=AMBULANCE_APPROACH_EPS_PX)
+    parser.add_argument("--supabase-url", default=SUPABASE_URL)
+    parser.add_argument("--supabase-key", default=SUPABASE_KEY)
+    parser.add_argument("--supabase-table", default=SUPABASE_TABLE)
+    parser.add_argument("--supabase-interval", type=float, default=SUPABASE_INTERVAL)
+    parser.add_argument("--supabase-timeout", type=float, default=SUPABASE_TIMEOUT)
+    parser.add_argument("--no-supabase", action="store_true")
     parser.add_argument("--no-signal", action="store_true")
     parser.add_argument("--no-tracking", action="store_true")
     parser.add_argument("--no-congestion", action="store_true")
@@ -1340,6 +1479,11 @@ if __name__ == "__main__":
     )
     print(f"  tracking: {'off' if args.no_tracking else args.tracker}")
     print(f"  congestion: {'off' if args.no_congestion else 'jetbot'}")
+    print(
+        "  supabase: "
+        f"{'off' if args.no_supabase else ('on' if args.supabase_url and args.supabase_key else 'missing config')} "
+        f"table={args.supabase_table or '-'}"
+    )
     print(f"  overlay: {'off' if args.no_overlay else 'on'}")
     print(f"  overlay control: http://{ip}:{MJPEG_PORT}/overlay?enabled=0 or 1")
     print("=" * 60)
