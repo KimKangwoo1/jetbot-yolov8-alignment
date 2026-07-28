@@ -6,3 +6,4 @@ onnxruntime>=1.16
 requests>=2.31
 lap>=0.5.12
 openvino>=2024.0
+supabase>=2.0
