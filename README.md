@@ -1,128 +1,188 @@
-# 지능형 CCTV 기반 도로교통 관제 및 긴급차량 우선 신호 제어
+# 🚦 JetBot 기반 지능형 교통신호 시스템
 
-> YOLO와 ByteTrack으로 차량 흐름을 분석하고 긴급차량 감지 시 ESP32 신호등에 우선 신호를 제공하는 실시간 교통 관제 시스템
+> **YOLOv8 객체 탐지 + ROI 기반 혼잡도 분석 + 긴급차량 우선 신호 제어**
 
-카메라 영상, Python 통신 서버, Flutter Web 대시보드, Supabase, ESP32 신호등을 하나의 실시간 파이프라인으로 통합한 캡스톤 프로젝트입니다.
+**2026.04 ~ 2026.08 · 4인 팀 캡스톤 프로젝트**
 
-## 핵심 기능
+이 프로젝트는 카메라 영상에서 일반 JetBot과 긴급차량을 탐지하고, 트랙에 설정한 ROI 영역을 기준으로 교통 상황을 분석해 **혼잡도 기반 신호 제어와 긴급차량 우선 신호**로 연결하는 지능형 교통 시스템입니다.
 
-- YOLOv8 기반 일반 차량·긴급차량 탐지
-- ByteTrack 기반 차량 ID 추적
-- 방향별 ROI의 차량 수·정지시간·속도 저하 분석
-- V/C·정지시간·속도 저하를 결합한 혼잡도 산정
-- 긴급차량 접근 방향 우선 신호 제어
-- MJPEG 스트리밍과 WebSocket 데이터 동기화
-- Supabase 교통 상태 저장
-- ESP32 NeoPixel 신호등 HTTP 제어
+> 이 저장소는 **팀 프로젝트 전체 코드와 산출물**을 포함하고 있습니다. 아래 `김강우 담당 역할`은 개인 포트폴리오 기준으로 실제 수행한 범위만 구분해 작성했습니다.
 
-## 시스템 구조
+---
+
+## 🎯 프로젝트 목표
+
+단순히 객체를 탐지하는 데서 끝나지 않고, 탐지된 차량의 **종류와 위치를 실제 교통신호 판단에 활용**하는 것을 목표로 했습니다.
 
 ```text
-Camera → YOLOv8 → ByteTrack → ROI Traffic Analysis
-                                      ▼
-                               Python Server
-                    ┌──────────┬──────────┬──────────┐
-                  MJPEG     WebSocket   Supabase   ESP32
-                    └──────── Flutter Web ───────────┘
+Camera
+  ↓
+YOLOv8 객체 탐지
+  ↓
+JetBot / Ambulance 구분
+  ↓
+ROI 영역 기준 위치 판단
+  ↓
+혼잡 상황 / 긴급차량 접근 판단
+  ↓
+신호 제어 및 대시보드 연동
 ```
 
-## 혼잡도와 우선 신호
+### 팀 시스템 주요 기능
 
-```text
-Congestion Score =
-V/C Score × 0.40 + Stop Time Score × 0.40 + Speed Drop Score × 0.20
-```
+- YOLOv8 기반 일반 JetBot / 긴급차량 탐지
+- 트랙 ROI 영역을 활용한 차량 위치 구분
+- 차량 수·정차시간 등의 요소를 활용한 혼잡 상황 분석
+- 긴급차량 접근 시 해당 방향 우선 신호 처리
+- ESP32 신호등 및 Flutter 대시보드와의 연동
 
-혼잡도 60점 이상이 3초간 유지되면 황색을 거쳐 녹색 신호로 전환합니다. 긴급차량은 일반 혼잡도보다 우선하며, 통과하거나 일정 시간 미감지되면 일반 제어로 복귀합니다.
+---
 
-## 모델 성능
+## 🙋‍♂️ 김강우 담당 역할
 
-| 지표 | 결과 |
+### 1. 긴급차량 외형 제작
+
+- 일반 JetBot과 시각적으로 구분할 수 있도록 **구급차 형태의 외형을 제작**했습니다.
+- 실제 트랙 주행과 객체 탐지 데이터 수집에 활용할 수 있도록 구성했습니다.
+
+### 2. 데이터 라벨링
+
+- JetBot과 Ambulance 객체를 구분하기 위한 **학습 데이터 라벨링 및 라벨 상태 점검**을 진행했습니다.
+- 최종 학습 데이터는 다음 규모로 구성했습니다.
+
+| Class | Images |
 |---|---:|
-| Precision | 0.996 |
-| Recall | 0.991 |
-| mAP50 | 0.995 |
-| mAP50-95 | 0.928 |
+| JetBot | 6,801 |
+| Ambulance | 8,021 |
+| **Total** | **약 14,800** |
 
-일반 JetBot 약 7,000장과 긴급차량 JetBot 약 8,000장의 데이터를 구축하고 YOLOv8n을 50 epoch 학습했습니다.
+### 3. YOLOv8n 최종 모델 학습
 
-## 담당 역할
-
-### 황준용
-
-- Flutter(SmartAI) 대시보드 전체 파이프라인 설계
-- Supabase 데이터베이스 구축
-- Python 통신 서버 구축
-- MJPEG·WebSocket·실시간 교통 데이터 연동
-- 팀 시스템 통합과 시연 지원
-
-### 팀 협업
-
-- 노효준: 데이터 수집·YOLO 모델 학습, 긴급차량 제작, 혼잡도 설계, Dashboard–Jetson 통신 지원
-- 김강우: 데이터 수집·모델 학습, Jetson Nano 최적화, 긴급차량 하드웨어 연동, JetBot 팔로잉
-- 오정훈: ESP32 신호등, ROI 혼잡도, 우선 신호 로직, 스트리밍·신호 제어 통합
-
-## 문제 해결
-
-### Flutter Web의 MJPEG 미지원
-
-PlatformView로 MJPEG 스트림을 연결하고 WebSocket과 상태 관리를 분리해 영상과 교통 데이터를 즉시 갱신했습니다.
-
-### 한 프로세스에 처리가 몰려 3 FPS까지 저하
-
-입력 해상도와 추론 간격을 조정하고 Intel CPU 환경에 맞춰 OpenVINO를 적용해 약 **16 FPS**까지 개선했습니다.
-
-### ESP32 회로 자료 부재
-
-NeoPixel 주소 지정 방식임을 확인하고 LED 번호를 직접 매핑해 HTTP 신호 제어를 구현했습니다.
+최종 객체 탐지 모델 학습을 담당했습니다.
 
 ```text
-GPIO 12
-RED 0-20 / YELLOW 21-41 / LEFT 42-50 / GREEN 51-71
+Model   : YOLOv8n
+Image   : 640
+Epochs  : 50
+Batch   : 8
+Workers : 2
+GPU     : Google Colab T4
 ```
 
-## 실행
+학습 완료 후 팀 시스템에서 활용할 수 있도록 최종 모델 결과를 정리하고 검증 지표를 확인했습니다.
 
-```powershell
-cd hyojun_streamer
-pip install -r requirements.txt
-python detect_stream.py --camera 1 --esp32-ip 192.168.0.162
-```
+### 4. 혼잡도 분석 내용 정리·공유
 
-선택 옵션:
+- 차량 수와 정차시간 등 **혼잡도를 판단할 때 고려할 요소와 전체 처리 흐름**을 정리했습니다.
+- 객체 탐지 이후 ROI 영역과 혼잡도 판단이 어떤 순서로 연결되는지 팀원들과 공유했습니다.
 
-```powershell
-python detect_stream.py --camera 1 --esp32-ip 192.168.0.162 --no-overlay
-python detect_stream.py --camera 1 --esp32-ip 192.168.0.162 --no-supabase
-```
+### 5. 트랙 ROI 구역 배치
 
-## 주요 경로
+- 트랙에서 차량의 위치를 구분하고 혼잡도 분석에 활용할 수 있도록 **ROI 분석 영역을 배치**했습니다.
+- 객체가 어떤 영역에서 탐지되었는지를 기준으로 이후 교통 상황 판단에 연결할 수 있도록 구성했습니다.
+
+---
+
+## 📊 최종 모델 성능
+
+최종 검증 결과는 다음과 같습니다.
+
+| Metric | Result |
+|---|---:|
+| Validation Images | 1,482 |
+| Instances | 1,500 |
+| Precision | **0.996** |
+| Recall | **0.991** |
+| mAP@50 | **0.995** |
+| mAP@50-95 | **0.928** |
+
+### Training Results
+
+![YOLOv8n Training Results](model/results.png)
+
+높은 Precision과 Recall을 확인했지만, 단순 수치만 보는 것이 아니라 학습 과정에서 **Loss 변화와 mAP 추이**도 함께 확인하며 최종 모델 상태를 검토했습니다.
+
+---
+
+## 🧠 ROI와 교통 판단 연결
+
+이 프로젝트에서 ROI는 객체 탐지 결과를 실제 시스템 판단으로 연결하기 위한 공간 기준으로 사용했습니다.
 
 ```text
-hyojun_streamer/detect_stream.py
-hyojun_streamer/JetBot_Last_openvino_model/
-hyojun_streamer/roi_config.json
-app/lib/
-esp32_signal_light_server/esp32_signal_light_server.ino
+차량 탐지
+  ↓
+탐지 위치 확인
+  ↓
+트랙 ROI 영역 구분
+  ↓
+영역별 차량 상황 확인
+  ↓
+혼잡도 및 긴급차량 우선 판단에 활용
 ```
 
-## 환경 변수
+객체가 **무엇인지** 탐지하는 것과 함께 **어디에서 탐지되었는지**를 구분해야 실제 교통신호 제어와 연결할 수 있다는 점을 프로젝트를 통해 경험했습니다.
+
+---
+
+## 🛠 기술 구성
+
+### 직접 사용 / 수행
+
+- Python
+- YOLOv8n
+- Google Colab
+- 데이터 라벨링
+- JetBot
+- ROI 구역 구성
+
+### 팀 시스템에서 활용
+
+- Jetson Nano
+- ESP32
+- Flutter Dashboard
+- ByteTrack
+- Supabase
+- 실시간 영상 스트리밍 / 신호 제어 모듈
+
+> 팀 시스템 기술은 저장소 전체 구성 기준이며, 각 기능의 직접 구현 담당은 팀원별로 구분됩니다.
+
+---
+
+## 📁 주요 산출물
 
 ```text
-SUPABASE_URL=your_project_url
-SUPABASE_KEY=your_key
-SUPABASE_TABLE=traffic_status
+model/
+├── JetBot_Last.pt       # YOLOv8 PyTorch 모델
+├── JetBot_Last.onnx     # ONNX 모델
+└── results.png          # 최종 학습 결과 그래프
+
+app/                     # Flutter Dashboard
+esp32_signal_light_server/
+ByteTrack-main/
+hyojun_streamer/
+supabase/
 ```
 
-> API 키와 서비스 키는 저장소에 커밋하지 마세요.
+모델 폴더에는 팀 프로젝트에서 사용한 최종 모델과 학습 결과 파일이 포함되어 있습니다.
 
-## 향후 개선
+---
 
-- 다양한 주행 환경 데이터 추가
-- 영상과 사이렌 음성을 결합한 긴급차량 판별
-- 혼잡도와 긴급도를 함께 반영한 신호 제어 고도화
-- Jetson Nano 온디바이스 추론과 대시보드 연동 강화
+## 💡 프로젝트를 통해 배운 점
 
-## 회고
+- 객체 탐지 모델의 성능은 학습 코드뿐 아니라 **데이터 라벨 상태와 클래스 기준**에 크게 영향을 받는다는 점을 경험했습니다.
+- Precision, Recall, mAP 지표를 직접 확인하면서 객체 탐지 모델을 평가하는 기준을 이해했습니다.
+- ROI를 이용해 객체 탐지 결과의 위치 정보를 구분하고, 이를 **혼잡도 판단 흐름에 연결하는 과정**을 이해했습니다.
+- 팀 프로젝트에서는 자신의 기능만 구현하는 것이 아니라 **앞뒤 기능이 어떤 기준으로 연결되는지 공유하는 과정**도 중요하다는 점을 배웠습니다.
 
-실시간 AI 시스템은 모델 정확도뿐 아니라 추론 속도, 스트리밍, 상태 동기화, 데이터 저장, 하드웨어 제어가 함께 맞아야 완성된다는 점을 배웠습니다.
+---
+
+## 📌 Project Info
+
+| Item | Description |
+|---|---|
+| Project Type | Computer Vision / Robot / Smart Traffic |
+| Period | 2026.04 ~ 2026.08 |
+| Team | 4인 팀 프로젝트 |
+| Model | YOLOv8n |
+| Dataset | JetBot 6,801 / Ambulance 8,021 |
+| Repository | `KimKangwoo1/jetbot-yolov8-alignment` |
